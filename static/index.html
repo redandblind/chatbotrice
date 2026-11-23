@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Asistente Virtual - Escuela Candelaria Pérez</title>
+    <style>
+        :root {
+            --azul-institucional: #1a365d;
+            --azul-claro: #2b6cb0;
+            --fondo-gris: #f0f4f8;
+            --blanco: #ffffff;
+            --texto: #1e293b;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; }
+        body { background-color: var(--fondo-gris); color: var(--texto); display: flex; flex-direction: column; height: 100dvh; }
+
+        /* Encabezado */
+        header {
+            background-color: var(--azul-institucional);
+            color: var(--blanco);
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+            z-index: 10;
+        }
+        .header-info h1 { font-size: 1.15rem; font-weight: 700; }
+        .header-info p { font-size: 0.8rem; opacity: 0.85; }
+        .btn-menu {
+            display: none; background: rgba(255,255,255,0.15); border: none; color: white;
+            padding: 8px 12px; border-radius: 6px; font-size: 1rem; cursor: pointer;
+        }
+
+        /* Contenedor Principal */
+        .contenedor { display: flex; flex: 1; overflow: hidden; position: relative; }
+
+        /* Barra Lateral (Historial en el teléfono) */
+        aside {
+            width: 280px;
+            background: var(--blanco);
+            border-right: 1px solid #cbd5e1;
+            display: flex;
+            flex-direction: column;
+            padding: 15px;
+            transition: transform 0.3s ease;
+        }
+        .btn-nuevo {
+            background-color: var(--azul-claro);
+            color: white;
+            border: none;
+            padding: 10px;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-bottom: 15px;
+        }
+        .btn-nuevo:hover { background-color: var(--azul-institucional); }
+        aside h3 { font-size: 0.85rem; text-transform: uppercase; color: #64748b; margin-bottom: 10px; }
+        .lista-historial { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+        .item-chat {
+            padding: 10px 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            background: #f8fafc;
+            border: 1px solid transparent;
+        }
+        .item-chat.activo {
+            background-color: var(--azul-institucional);
+            color: white;
+            font-weight: 600;
+        }
+        .btn-borrar-todo {
+            margin-top: 10px; background: none; border: 1px solid #e2e8f0;
+            color: #64748b; padding: 6px; border-radius: 6px; font-size: 0.8rem; cursor: pointer;
+        }
+
+        /* Área de Chat */
+        main { flex: 1; display: flex; flex-direction: column; background: #f8fafc; }
+        .mensajes { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+        .burbuja {
+            max-width: 80%;
+            padding: 12px 16px;
+            border-radius: 14px;
+            line-height: 1.5;
+            font-size: 0.95rem;
+            white-space: pre-wrap;
+        }
+        .burbuja.user {
+            align-self: flex-end;
+            background-color: var(--azul-claro);
+            color: white;
+            border-bottom-right-radius: 4px;
+        }
+        .burbuja.model {
+            align-self: flex-start;
+            background-color: var(--blanco);
+            color: var(--texto);
+            border: 1px solid #e2e8f0;
+            border-bottom-left-radius: 4px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }
+
+        /* Bandeja de entrada */
+        .entrada-area {
+            padding: 12px 16px;
+            background: var(--blanco);
+            border-top: 1px solid #cbd5e1;
+            display: flex;
+            gap: 10px;
+        }
+        input[type="text"] {
+            flex: 1;
+            padding: 12px 16px;
+            border: 1px solid #cbd5e1;
+            border-radius: 24px;
+            font-size: 1rem;
+            outline: none;
+        }
+        input[type="text"]:focus { border-color: var(--azul-claro); }
+        .btn-enviar {
+            background-color: var(--azul-institucional);
+            color: white;
+            border: none;
+            padding: 0 20px;
+            border-radius: 24px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .btn-enviar:disabled { opacity: 0.5; }
+
+        /* Adaptación a Teléfonos Móviles */
+        @media (max-width: 768px) {
+            .btn-menu { display: block; }
+            aside {
+                position: absolute;
+                height: 100%;
+                z-index: 20;
+                transform: translateX(-100%);
+                box-shadow: 2px 0 10px rgba(0,0,0,0.2);
+            }
+            aside.abierto { transform: translateX(0); }
+            .burbuja { max-width: 90%; }
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="header-info">
+        <h1>Escuela Candelaria Pérez - Asistente</h1>
+        <p>Escuela G-416 • Alquihue, San Javier</p>
+    </div>
+    <button class="btn-menu" onclick="toggleMenu()">☰ Historial</button>
+</header>
+
+<div class="contenedor">
+    <aside id="sidebar">
+        <button class="btn-nuevo" onclick="nuevoChat()">+ Nueva Consulta</button>
+        <h3>Consultas en este teléfono</h3>
+        <div class="lista-historial" id="listaHistorial"></div>
+        <button class="btn-borrar-todo" onclick="borrarHistorial()">Limpiar historial del teléfono</button>
+    </aside>
+
+    <main>
+        <div class="mensajes" id="cajaMensajes"></div>
+        <form class="entrada-area" onsubmit="enviarMensaje(event)">
+            <input type="text" id="inputPregunta" placeholder="Escribe tu consulta sobre el reglamento..." autocomplete="off" required>
+            <button type="submit" class="btn-enviar" id="btnEnviar">Enviar</button>
+        </form>
+    </main>
+</div>
+
+<script>
+    // Clave única para guardar el historial en el navegador del teléfono
+    const STORAGE_KEY = "candelaria_perez_chats_v1";
+    let conversaciones = JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
+    let chatActualId = null;
+
+    function guardarEnTelefono() {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(conversaciones));
+        renderizarHistorial();
+    }
+
+    function toggleMenu() {
+        document.getElementById("sidebar").classList.toggle("abierto");
+    }
+
+    function nuevoChat() {
+        const nuevo = {
+            id: Date.now().toString(),
+            titulo: "Nueva consulta",
+            mensajes: [
+                { role: "model", text: "Hola. Soy el asistente virtual de la Escuela Candelaria Pérez. ¿En qué te puedo ayudar respecto al Reglamento de Evaluación o Convivencia Escolar?" }
+            ]
+        };
+        conversaciones.unshift(nuevo);
+        chatActualId = nuevo.id;
+        guardarEnTelefono();
+        renderizarMensajes();
+        document.getElementById("sidebar").classList.remove("abierto");
+    }
+
+    function seleccionarChat(id) {
+        chatActualId = id;
+        renderizarHistorial();
+        renderizarMensajes();
+        document.getElementById("sidebar").classList.remove("abierto");
+    }
+
+    function borrarHistorial() {
+        if (confirm("¿Deseas borrar todas las consultas guardadas en este teléfono?")) {
+            localStorage.removeItem(STORAGE_KEY);
+            conversaciones = [];
+            nuevoChat();
+        }
+    }
+
+    function renderizarHistorial() {
+        const lista = document.getElementById("listaHistorial");
+        lista.innerHTML = "";
+        conversaciones.forEach(chat => {
+            const div = document.createElement("div");
+            div.className = "item-chat" + (chat.id === chatActualId ? " activo" : "");
+            div.textContent = chat.titulo;
+            div.onclick = () => seleccionarChat(chat.id);
+            lista.appendChild(div);
+        });
+    }
+
+    function renderizarMensajes() {
+        const caja = document.getElementById("cajaMensajes");
+        caja.innerHTML = "";
+        const chat = conversaciones.find(c => c.id === chatActualId);
+        if (!chat) return;
+
+        chat.mensajes.forEach(m => {
+            const div = document.createElement("div");
+            div.className = "burbuja " + m.role;
+            div.textContent = m.text;
+            caja.appendChild(div);
+        });
+        caja.scrollTop = caja.scrollHeight;
+    }
+
+    async function enviarMensaje(e) {
+        e.preventDefault();
+        const input = document.getElementById("inputPregunta");
+        const btn = document.getElementById("btnEnviar");
+        const texto = input.value.trim();
+        if (!texto) return;
+
+        const chat = conversaciones.find(c => c.id === chatActualId);
+        
+        // Actualizar título del chat en la barra lateral con la primera pregunta
+        if (chat.mensajes.length === 1) {
+            chat.titulo = texto.length > 32 ? texto.substring(0, 32) + "..." : texto;
+        }
+
+        // Guardar mensaje del usuario en el teléfono
+        const historialPrevio = chat.mensajes.slice(1); // Excluir saludo inicial
+        chat.mensajes.push({ role: "user", text: texto });
+        input.value = "";
+        btn.disabled = true;
+        guardarEnTelefono();
+        renderizarMensajes();
+
+        // Mostrar indicador de carga
+        const caja = document.getElementById("cajaMensajes");
+        const cargando = document.createElement("div");
+        cargando.className = "burbuja model";
+        cargando.textContent = "Consultando reglamentos...";
+        caja.appendChild(cargando);
+        caja.scrollTop = caja.scrollHeight;
+
+        try {
+            const res = await fetch("/api/chat", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    mensaje: texto,
+                    historial: historialPrevio
+                })
+            });
+            const data = await res.json();
+            cargando.remove();
+
+            if (res.ok) {
+                chat.mensajes.push({ role: "model", text: data.respuesta });
+            } else {
+                chat.mensajes.push({ role: "model", text: "Error al consultar el servidor: " + data.detail });
+            }
+        } catch (err) {
+            cargando.remove();
+            chat.mensajes.push({ role: "model", text: "Error de conexión. Verifica tu internet." });
+        }
+
+        btn.disabled = false;
+        guardarEnTelefono();
+        renderizarMensajes();
+    }
+
+    // Inicializar al abrir desde Google/navegador
+    if (conversaciones.length === 0) {
+        nuevoChat();
+    } else {
+        chatActualId = conversaciones[0].id;
+        renderizarHistorial();
+        renderizarMensajes();
+    }
+</script>
+
+</body>
+</html>
