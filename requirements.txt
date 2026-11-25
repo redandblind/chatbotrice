@@ -1,5 +1,8 @@
 fastapi
 uvicorn
-python-docx
+passlib[bcrypt]
+bcrypt==4.0.1
+python-dotenv
 pydantic
-openai
+psycopg2-binary
+tzdata

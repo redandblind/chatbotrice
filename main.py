@@ -1,333 +1,1129 @@
 import os
-import re
-import unicodedata
-import docx
-from fastapi import FastAPI, HTTPException
+import hmac
+import hashlib
+import base64
+import json
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from typing import Optional, List
+import psycopg2
+from psycopg2 import pool
+from psycopg2.extras import RealDictCursor
+from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import List, Dict
-from openai import OpenAI
+from passlib.context import CryptContext
+from dotenv import load_dotenv
 
-API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+load_dotenv()
 
-app = FastAPI(title="Asistente Virtual - Escuela Candelaria Pérez")
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+SECRET_KEY = (os.getenv("SECRET_KEY") or "ecp-sanjavier-secret-2026-clave-interna").strip()
+CHILE_TZ = ZoneInfo("America/Santiago")
 
+app = FastAPI(title="API Portal Escolar v8.0 - Escuela Candelaria Pérez")
 
-def normalizar_texto(texto: str) -> str:
-    """Elimina tildes y pasa a minúsculas para mejorar la coincidencia de búsqueda."""
-    texto = texto.lower()
-    return "".join(
-        c for c in unicodedata.normalize("NFD", texto)
-        if unicodedata.category(c) != "Mn"
-    )
-
-
-def extraer_bloques_estructurados(ruta_archivo: str, nombre_doc: str) -> List[Dict]:
-    """
-    Extrae párrafos y tablas respetando el orden exacto de aparición en el Word
-    y agrupa el contenido por Artículos, Títulos, Protocolos y Anexos completos.
-    """
-    if not os.path.exists(ruta_archivo):
-        raise FileNotFoundError(f"No se encontró el archivo: {ruta_archivo}")
-
-    doc = docx.Document(ruta_archivo)
-    elementos = []
-
-    # Recorre párrafos y tablas en el orden exacto en que aparecen en el documento
-    for bloque in doc.element.body:
-        tag = bloque.tag.split("}")[-1]
-        if tag == "p":
-            texto = "".join(bloque.itertext()).strip()
-            if texto:
-                elementos.append(("p", texto))
-        elif tag == "tbl":
-            filas_texto = []
-            for tr in bloque.findall(".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr"):
-                celdas = []
-                for tc in tr.findall(".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tc"):
-                    celda_txt = " ".join("".join(tc.itertext()).split())
-                    if celda_txt:
-                        celdas.append(celda_txt)
-                if celdas:
-                    filas_texto.append(" | ".join(celdas))
-            if filas_texto:
-                elementos.append(("tbl", "\n".join(filas_texto)))
-
-    # Patrones de inicio de sección estructural
-    patron_inicio = re.compile(
-        r"^(T[ÍI]TULO\s+[IVXLC]+|Art[íi]culo\s+\d+|PROTOCOLO\s+|ANEXO\s+\d+|\d+\)\s*PROTOCOLO|"
-        r"[IVXLC]+\.\s+[A-ZÁÉÍÓÚÑ]{4,}|DEL\s+[A-ZÁÉÍÓÚÑ\s]{5,}|DE\s+LA[S]?\s+[A-ZÁÉÍÓÚÑ\s]{5,})",
-        re.IGNORECASE
-    )
-
-    secciones = []
-    titulo_actual = f"{nombre_doc} - Introducción / Disposiciones Iniciales"
-    buffer_lineas = []
-    indice_encontrado = False
-
-    for tipo, texto in elementos:
-        # Omitir las líneas punteadas del índice inicial para no contaminar búsquedas
-        if re.search(r"\.{5,}\s*\d+$", texto):
-            indice_encontrado = True
-            continue
-
-        es_encabezado = (tipo == "p" and len(texto) < 180 and patron_inicio.match(texto))
-
-        if es_encabezado and buffer_lineas:
-            contenido_seccion = "\n".join(buffer_lineas).strip()
-            if len(contenido_seccion) > 40:
-                secciones.append({
-                    "doc": nombre_doc,
-                    "titulo": titulo_actual,
-                    "contenido": f"[{nombre_doc} | {titulo_actual}]\n{contenido_seccion}",
-                    "norm": normalizar_texto(f"{titulo_actual} {contenido_seccion}")
-                })
-            titulo_actual = texto
-            buffer_lineas = [texto]
-        else:
-            if es_encabezado and not buffer_lineas:
-                titulo_actual = texto
-            buffer_lineas.append(texto)
-
-    if buffer_lineas:
-        contenido_seccion = "\n".join(buffer_lineas).strip()
-        if len(contenido_seccion) > 40:
-            secciones.append({
-                "doc": nombre_doc,
-                "titulo": titulo_actual,
-                "contenido": f"[{nombre_doc} | {titulo_actual}]\n{contenido_seccion}",
-                "norm": normalizar_texto(f"{titulo_actual} {contenido_seccion}")
-            })
-
-    # Si alguna sección (ej. tabla larga de faltas o protocolo) supera 3200 caracteres,
-    # se subdivide en partes conservando el encabezado para no perder ningún ítem
-    secciones_finales = []
-    for sec in secciones:
-        txt = sec["contenido"]
-        if len(txt) <= 3200:
-            secciones_finales.append(sec)
-        else:
-            lineas = txt.split("\n")
-            encabezado = lineas[0]
-            parte = [encabezado]
-            largo = len(encabezado)
-            num_parte = 1
-            for linea in lineas[1:]:
-                if largo + len(linea) > 3000 and len(parte) > 1:
-                    bloque_txt = "\n".join(parte)
-                    secciones_finales.append({
-                        "doc": sec["doc"],
-                        "titulo": f"{sec['titulo']} (Parte {num_parte})",
-                        "contenido": bloque_txt,
-                        "norm": normalizar_texto(bloque_txt)
-                    })
-                    num_parte += 1
-                    parte = [f"{encabezado} (Continuación Parte {num_parte})", linea]
-                    largo = len(parte[0]) + len(linea)
-                else:
-                    parte.append(linea)
-                    largo += len(linea)
-            if len(parte) > 1:
-                bloque_txt = "\n".join(parte)
-                secciones_finales.append({
-                    "doc": sec["doc"],
-                    "titulo": f"{sec['titulo']} (Parte {num_parte})",
-                    "contenido": bloque_txt,
-                    "norm": normalizar_texto(bloque_txt)
-                })
-
-    return secciones_finales
-
-
-SECCIONES_DOCS = (
-    extraer_bloques_estructurados(
-        "REGLAMENTO DE EVALUACIÓN, PROMOCIÓN Y CALIFICACIONES abril 2026 CON INDICE.docx",
-        "REGLAMENTO DE EVALUACIÓN 2026"
-    )
-    + extraer_bloques_estructurados(
-        "RICE 2026 (ACTUALIZADO AGOSTO).docx",
-        "RICE CONVIVENCIA EDUCATIVA 2026"
-    )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-STOPWORDS = {
-    "como", "para", "pero", "porque", "sobre", "entre", "hasta", "desde",
-    "donde", "cuando", "quien", "cual", "cuales", "este", "esta", "estos",
-    "estas", "hacer", "debe", "debo", "puede", "puedo", "tiene", "tienen",
-    "alumno", "alumnos", "estudiante", "estudiantes", "escuela", "reglamento",
-    "dice", "sobre", "acerca", "favor", "necesito", "saber", "cuales", "que"
-}
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+db_pool: Optional[pool.SimpleConnectionPool] = None
 
-SINONIMOS = {
-    "pelea": ["agresion", "fisica", "maltrato", "violencia", "golpe"],
-    "pelean": ["agresion", "fisica", "maltrato", "violencia", "golpe"],
-    "golpe": ["agresion", "fisica", "maltrato", "lesion"],
-    "celular": ["telefono", "movil", "electronico", "21801", "dispositivo"],
-    "telefono": ["celular", "movil", "electronico", "21801", "dispositivo"],
-    "nota": ["calificacion", "promedio", "evaluacion", "40", "70", "exigencia"],
-    "notas": ["calificaciones", "promedio", "evaluacion", "semestral", "final"],
-    "repitencia": ["promocion", "reprobado", "asistencia", "85", "riesgo"],
-    "repetir": ["promocion", "repitencia", "reprobado", "85"],
-    "falta": ["inasistencia", "justificar", "certificado", "medico", "48"],
-    "falto": ["inasistencia", "justificar", "certificado", "medico", "48"],
-    "copia": ["copiando", "adulterar", "evaluacion", "grave", "torpedo"],
-    "copiando": ["copia", "adulterar", "evaluacion", "grave", "torpedo"],
-    "accidente": ["seguro", "escolar", "313", "salud", "ambulancia", "declaracion"],
-    "embarazo": ["embarazada", "maternidad", "lactancia", "prenatal", "postparto"],
-    "embarazada": ["embarazo", "maternidad", "lactancia", "prenatal", "postparto"],
-    "pie": ["adecuacion", "curricular", "paci", "dua", "necesidades", "83"],
-    "tea": ["autista", "acompanamiento", "emocional", "conductual", "gatillantes"],
-    "autismo": ["autista", "acompanamiento", "emocional", "conductual", "gatillantes"],
-    "droga": ["alcohol", "sustancias", "vaper", "cigarro", "gravisima"],
-    "alcohol": ["droga", "sustancias", "ebriedad", "gravisima"],
-    "apelar": ["apelacion", "reconsideracion", "48", "horas", "sancion"],
-    "expulsion": ["caducidad", "matricula", "condicionalidad", "superintendencia"],
-    "bano": ["avd", "vida", "diaria", "higiene", "muda", "ropa"],
-    "uniforme": ["vestuario", "buzo", "pantalon", "falda", "corbata", "presentacion"],
-    "horario": ["jornada", "entrada", "salida", "0830", "1555", "1330", "atraso"]
-}
+CURSOS_INICIALES = [
+    ("1° Básico", 1),
+    ("2° Básico", 2),
+    ("3° Básico", 3),
+    ("4° Básico", 4),
+    ("5° Básico", 5),
+    ("6° Básico", 6),
+    ("7° Básico", 7),
+    ("8° Básico", 8),
+]
 
+ASIGNATURAS_INICIALES = [
+    "Lenguaje y Comunicación",
+    "Matemática",
+    "Historia, Geografía y Ciencias Sociales",
+    "Ciencias Naturales",
+    "Artes Visuales",
+    "Educación Física y Salud",
+    "Tecnología",
+    "Música",
+    "Inglés",
+    "Religión",
+    "Orientación"
+]
 
-def buscar_contexto_relevante(consulta: str, max_caracteres: int = 21000) -> str:
-    """
-    Recupera la mayor cantidad posible de artículos y protocolos exactos
-    manteniendo el total dentro de la ventana segura de tokens de Groq.
-    """
-    consulta_norm = normalizar_texto(consulta)
-    tokens_base = [
-        p for p in re.findall(r"[a-z0-9]+", consulta_norm)
-        if len(p) >= 2 and p not in STOPWORDS
-    ]
+def ahora_chile() -> datetime:
+    return datetime.now(CHILE_TZ)
 
-    # Detectar si el usuario preguntó explícitamente por un número de artículo
-    numeros_articulo = re.findall(r"articulo\s+(\d+)", consulta_norm)
+def normalizar_rut(rut: str) -> str:
+    limpio = rut.strip().upper().replace(".", "").replace(" ", "")
+    if "-" not in limpio and len(limpio) >= 2:
+        limpio = f"{limpio[:-1]}-{limpio[-1]}"
+    return limpio
 
-    palabras_expandidas = set(tokens_base)
-    for token in tokens_base:
-        if token in SINONIMOS:
-            palabras_expandidas.update(SINONIMOS[token])
+def validar_rut_modulo11(rut: str) -> bool:
+    rut_norm = normalizar_rut(rut)
+    if "-" not in rut_norm:
+        return False
+    cuerpo, dv = rut_norm.split("-", 1)
+    if not cuerpo.isdigit() or not (7 <= len(cuerpo) <= 8) or dv not in "0123456789K":
+        return False
+    suma = 0
+    multiplo = 2
+    for c in reversed(cuerpo):
+        suma += int(c) * multiplo
+        multiplo = 2 if multiplo == 7 else multiplo + 1
+    resto = 11 - (suma % 11)
+    dv_esperado = "0" if resto == 11 else ("K" if resto == 10 else str(resto))
+    return dv == dv_esperado
 
-    puntuados = []
-    for idx, sec in enumerate(SECCIONES_DOCS):
-        puntaje = 0
-        norm_txt = sec["norm"]
-        titulo_norm = normalizar_texto(sec["titulo"])
+def crear_token_usuario(nombre: str, rol: str, cursos: list) -> str:
+    payload = {
+        "rol": rol,
+        "nombre": nombre,
+        "cursos": cursos,
+        "exp": int((ahora_chile() + timedelta(hours=12)).timestamp())
+    }
+    raw = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    sig = hmac.new(SECRET_KEY.encode(), raw.encode(), hashlib.sha256).hexdigest()
+    return f"{raw}.{sig}"
 
-        # Coincidencia directa con número de artículo pedido
-        for num in numeros_articulo:
-            if f"articulo {num}" in titulo_norm or f"articulo {num}." in titulo_norm or f"articulo {num}:" in titulo_norm:
-                puntaje += 100
-
-        # Coincidencia de términos principales y sinónimos
-        for palabra in palabras_expandidas:
-            es_original = palabra in tokens_base
-            peso = 4 if es_original else 2
-            if len(palabra) >= 6:
-                peso += 2
-
-            apariciones_titulo = titulo_norm.count(palabra)
-            apariciones_cuerpo = norm_txt.count(palabra)
-
-            if apariciones_titulo > 0:
-                puntaje += apariciones_titulo * (peso * 3)
-            if apariciones_cuerpo > 0:
-                puntaje += min(apariciones_cuerpo, 6) * peso
-
-        if puntaje > 0:
-            puntuados.append((puntaje, idx, sec["contenido"]))
-
-    puntuados.sort(key=lambda x: x[0], reverse=True)
-
-    seleccionados = []
-    total_chars = 0
-    for puntaje, idx, contenido in puntuados:
-        if total_chars + len(contenido) <= max_caracteres:
-            seleccionados.append((idx, contenido))
-            total_chars += len(contenido)
-        if len(seleccionados) >= 12:
-            break
-
-    if not seleccionados:
-        # Si es una pregunta muy general, entrega disposiciones generales de ambos reglamentos
-        fallback = [s["contenido"] for s in SECCIONES_DOCS[:6]]
-        return "\n\n========================================\n\n".join(fallback)
-
-    # Ordena los artículos según su orden real en el reglamento
-    seleccionados.sort(key=lambda x: x[0])
-    return "\n\n========================================\n\n".join(c for _, c in seleccionados)
-
-
-def limpiar_formato_sin_asteriscos(texto: str) -> str:
-    """Elimina cualquier asterisco o símbolo Markdown residual en la respuesta."""
-    texto = re.sub(r"\*\*(.*?)\*\*", r"\1", texto)
-    texto = re.sub(r"\*(.*?)\*", r"\1", texto)
-    texto = texto.replace("*", "")
-    texto = re.sub(r"^#{1,6}\s*", "", texto, flags=re.MULTILINE)
-    return texto.strip()
-
-
-client = OpenAI(api_key=API_KEY, base_url="https://api.groq.com/openai/v1") if API_KEY else None
-MODELO = "openai/gpt-oss-120b"
-
-
-class Mensaje(BaseModel):
-    role: str
-    text: str
-
-
-class SolicitudChat(BaseModel):
-    mensaje: str
-    historial: List[Mensaje] = []
-
-
-@app.post("/api/chat")
-async def procesar_chat(solicitud: SolicitudChat):
-    if not API_KEY or client is None:
-        raise HTTPException(status_code=500, detail="Falta configurar la variable GROQ_API_KEY en el servidor.")
+def verificar_auth(authorization: Optional[str] = Header(None), roles_permitidos: list = ["docente", "maestro"]) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Sesión requerida")
+    token = authorization.split(" ", 1)[1].strip()
+    if "." not in token:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    raw, sig = token.split(".", 1)
+    expected = hmac.new(SECRET_KEY.encode(), raw.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(status_code=401, detail="Firma de token inválida")
     try:
-        contexto_filtrado = buscar_contexto_relevante(solicitud.mensaje)
+        payload = json.loads(base64.urlsafe_b64decode(raw.encode()).decode())
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token corrupto")
+    rol = payload.get("rol")
+    if rol not in roles_permitidos or payload.get("exp", 0) < int(ahora_chile().timestamp()):
+        raise HTTPException(status_code=403, detail="No tienes permisos suficientes o la sesión expiró")
+    return payload
 
-        instrucciones = f"""
-Eres el asistente virtual oficial de la Escuela G-416 Candelaria Pérez (RBD 3517-3, localidad de Alquihue, San Javier, Chile).
+def get_pool():
+    global db_pool
+    if not DATABASE_URL:
+        raise HTTPException(status_code=500, detail="Falta configurar DATABASE_URL en Render (Environment)")
+    if db_pool is None:
+        for intento in range(3):
+            try:
+                db_pool = pool.SimpleConnectionPool(
+                    1, 10, DATABASE_URL, cursor_factory=RealDictCursor
+                )
+                break
+            except Exception as e:
+                if intento == 2:
+                    raise HTTPException(status_code=503, detail=f"Base de datos despertando, intenta nuevamente: {str(e)}")
+                time.sleep(1.5)
+    return db_pool
 
-REGLAS ESTRICTAS DE FORMATO (OBLIGATORIAS):
-- PROHIBIDO USAR ASTERISCOS (*) EN CUALQUIER PARTE DE LA RESPUESTA. No uses **negritas**, ni *cursivas*, ni viñetas con asterisco.
-- PROHIBIDO USAR ALMOHADILLAS (#) O SÍMBOLOS MARKDOWN.
-- Escribe en texto plano limpio, ordenado y muy fácil de leer. Para destacar títulos o secciones usa MAYÚSCULAS seguidas de dos puntos (ejemplo: ARTÍCULO 40 - INASISTENCIA SIN JUSTIFICACIÓN:). Para enumerar pasos o requisitos usa números (1., 2., 3.) o guiones simples (-).
+class DBConnection:
+    def __init__(self):
+        self.pool = get_pool()
+        self.conn = self.pool.getconn()
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        except Exception:
+            try:
+                self.pool.putconn(self.conn, close=True)
+            except Exception:
+                pass
+            self.conn = self.pool.getconn()
 
-REGLAS DE EXACTITUD Y COMPLETITUD (OBLIGATORIAS):
-1. RESPUESTA EXHAUSTIVA Y DETALLADA: Nunca resumas ni recortes información importante. Entrega TODOS los detalles, pasos, plazos exactos (horas, días hábiles, fechas), porcentajes de exigencia o asistencia, responsables por cargo, sanciones específicas (con y sin sanción anterior), excepciones y documentos asociados que aparezcan en los extractos oficiales.
-2. CITA LITERAL Y EXACTA: Siempre indica el documento exacto (Reglamento de Evaluación 2026 o RICE 2026), el número de Artículo, Título, Protocolo o Anexo correspondiente. Si el texto tiene tablas (como cantidad mínima de notas o faltas graves/gravísimas), incluye todos los datos aplicables al caso consultado.
-3. NORMATIVA CHILENA COMPLEMENTARIA: Si la consulta involucra leyes mencionadas en los documentos (Decreto 67/2018, Decreto 83/2015, Decreto 170, Ley 21.801 sobre celulares, Ley Karin Decreto 2227, Ley Aula Segura, Seguro Escolar DS 313, Ordinario 05/2610 AVD) o pide redactar una carta formal de apelación o justificación, entrega la orientación completa respetando al pie de la letra los plazos y reglas internas de la Escuela Candelaria Pérez.
-4. HONESTIDAD DOCUMENTAL: No inventes artículos, porcentajes ni normas que no existan en los documentos proporcionados.
+    def cursor(self):
+        return self.conn.cursor()
 
-=== BASE DOCUMENTAL OFICIAL DE LA ESCUELA CANDELARIA PÉREZ (2026) ===
-{contexto_filtrado}
-"""
-        mensajes = [{"role": "system", "content": instrucciones}]
+    def commit(self):
+        self.conn.commit()
 
-        for msg in solicitud.historial[-4:]:
-            rol = "assistant" if msg.role == "model" else msg.role
-            mensajes.append({"role": rol, "content": msg.text})
+    def rollback(self):
+        self.conn.rollback()
 
-        mensajes.append({"role": "user", "content": solicitud.mensaje})
+    def close(self):
+        if self.conn:
+            try:
+                self.pool.putconn(self.conn)
+            except Exception:
+                pass
+            self.conn = None
 
-        respuesta = client.chat.completions.create(
-            model=MODELO,
-            messages=mensajes,
-            temperature=0.15,
-            max_tokens=2048,
+def registrar_log(cursor, usuario: str, accion: str, detalle: str):
+    try:
+        cursor.execute(
+            "INSERT INTO auditoria_logs (fecha, usuario, accion, detalle) VALUES (%s, %s, %s, %s)",
+            (ahora_chile().strftime("%Y-%m-%d %H:%M:%S"), usuario, accion, detalle)
         )
-        texto_limpio = limpiar_formato_sin_asteriscos(respuesta.choices[0].message.content)
-        return {"respuesta": texto_limpio}
+    except Exception:
+        pass
+
+def siguiente_curso_db(cursor, curso_actual: str) -> str:
+    cursor.execute("SELECT nombre, orden FROM cursos ORDER BY orden ASC, id ASC")
+    lista = [dict(r) for r in cursor.fetchall()]
+    nombres = [c["nombre"] for c in lista]
+    if curso_actual in nombres:
+        idx = nombres.index(curso_actual)
+        if idx + 1 < len(nombres):
+            return nombres[idx + 1]
+        return "EGRESADO"
+    return curso_actual
+
+def calcular_promedio_alumno(notas_alumno: list) -> Optional[float]:
+    by_asig = {}
+    for n in notas_alumno:
+        try:
+            val = float(n["nota"])
+            if 1.0 <= val <= 7.0:
+                by_asig.setdefault(n["asignatura"], []).append(val)
+        except Exception:
+            continue
+    if not by_asig:
+        return None
+    promedios_asig = [sum(vals) / len(vals) for vals in by_asig.values()]
+    return round(sum(promedios_asig) / len(promedios_asig), 1)
+
+def ejecutar_promocion_anual(cursor, anio: int, ejecutor: str = "SISTEMA AUTOMÁTICO"):
+    cursor.execute("SELECT * FROM alumnos WHERE activo = 1")
+    alumnos = [dict(r) for r in cursor.fetchall()]
+
+    for al in alumnos:
+        rut = al["rut"]
+        curso_actual = al["curso"]
+        cursor.execute("SELECT asignatura, nota FROM notas WHERE rut = %s", (rut,))
+        notas = [dict(r) for r in cursor.fetchall()]
+        prom = calcular_promedio_alumno(notas)
+
+        aprueba = (prom is None) or (prom >= 4.0)
+        nuevo_curso = siguiente_curso_db(cursor, curso_actual) if aprueba else curso_actual
+        estado_final = "PROMOVIDO" if aprueba else "REPITE"
+
+        if nuevo_curso == "EGRESADO":
+            estado_final = "EGRESADO"
+            cursor.execute("UPDATE alumnos SET activo = 0 WHERE rut = %s", (rut,))
+        else:
+            cursor.execute("UPDATE alumnos SET curso = %s WHERE rut = %s", (nuevo_curso, rut))
+
+        cursor.execute(
+            """
+            INSERT INTO historial_anual (anio, rut, nombre, curso_anterior, curso_nuevo, promedio_final, estado)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (anio, rut, al["nombre"], curso_actual, nuevo_curso, prom, estado_final)
+        )
+
+    cursor.execute(
+        "UPDATE configuracion_calendario SET ultimo_anio_promocion = %s WHERE id = 1",
+        (anio,)
+    )
+    registrar_log(cursor, ejecutor, "CIERRE_ANUAL", f"Promoción anual {anio} ejecutada para {len(alumnos)} alumnos.")
+
+def ejecutar_limpieza_enero(cursor, anio_nuevo: int):
+    cursor.execute("DELETE FROM notas")
+    cursor.execute("DELETE FROM anuncios")
+    cursor.execute("DELETE FROM justificaciones")
+    cursor.execute("DELETE FROM asistencia")
+    cursor.execute(
+        "UPDATE configuracion_calendario SET ultimo_anio_limpieza = %s WHERE id = 1",
+        (anio_nuevo,)
+    )
+    registrar_log(cursor, "SISTEMA AUTOMÁTICO", "LIMPIEZA_ENERO", f"Limpieza anual 1 de enero {anio_nuevo}.")
+
+def verificar_automatizacion_calendario():
+    if not DATABASE_URL:
+        return
+    ahora = ahora_chile()
+    anio = ahora.year
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT * FROM configuracion_calendario WHERE id = 1")
+        cfg = cursor.fetchone()
+        if not cfg:
+            return
+        mes_cierre = cfg["mes_cierre"]
+        dia_cierre = cfg["dia_cierre"]
+        ultimo_prom = cfg["ultimo_anio_promocion"]
+        ultimo_limp = cfg["ultimo_anio_limpieza"]
+
+        if (ahora.month == 1 and ahora.day >= 1) and ultimo_limp < anio:
+            if ultimo_prom < (anio - 1):
+                ejecutar_promocion_anual(cursor, anio - 1)
+            ejecutar_limpieza_enero(cursor, anio)
+            conn.commit()
+
+        if (ahora.month > mes_cierre or (ahora.month == mes_cierre and ahora.day >= dia_cierre)) and ultimo_prom < anio:
+            ejecutar_promocion_anual(cursor, anio)
+            conn.commit()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        conn.rollback()
+        print("Advertencia calendario:", e)
+    finally:
+        cursor.close()
+        conn.close()
 
+def init_db():
+    if not DATABASE_URL:
+        return
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        sentencias = [
+            """CREATE TABLE IF NOT EXISTS cursos (
+                id SERIAL PRIMARY KEY,
+                nombre TEXT UNIQUE NOT NULL,
+                orden INTEGER DEFAULT 10
+            )""",
+            """CREATE TABLE IF NOT EXISTS asignaturas (
+                id SERIAL PRIMARY KEY,
+                nombre TEXT UNIQUE NOT NULL,
+                activa INTEGER DEFAULT 1
+            )""",
+            """CREATE TABLE IF NOT EXISTS alumnos (
+                rut TEXT PRIMARY KEY,
+                nombre TEXT NOT NULL,
+                curso TEXT NOT NULL,
+                activo INTEGER DEFAULT 1
+            )""",
+            """CREATE TABLE IF NOT EXISTS docentes (
+                id SERIAL PRIMARY KEY,
+                nombre TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                cursos TEXT NOT NULL,
+                rol TEXT DEFAULT 'docente',
+                activo INTEGER DEFAULT 1
+            )""",
+            "ALTER TABLE docentes ADD COLUMN IF NOT EXISTS rol TEXT DEFAULT 'docente'",
+            "ALTER TABLE docentes ADD COLUMN IF NOT EXISTS activo INTEGER DEFAULT 1",
+            """CREATE TABLE IF NOT EXISTS notas (
+                id SERIAL PRIMARY KEY,
+                rut TEXT NOT NULL,
+                asignatura TEXT NOT NULL,
+                nota REAL NOT NULL,
+                semestre INTEGER NOT NULL,
+                fecha TEXT NOT NULL,
+                docente TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS asistencia (
+                id SERIAL PRIMARY KEY,
+                rut TEXT NOT NULL,
+                curso TEXT NOT NULL,
+                fecha TEXT NOT NULL,
+                estado TEXT NOT NULL,
+                docente TEXT NOT NULL,
+                UNIQUE(rut, fecha)
+            )""",
+            """CREATE TABLE IF NOT EXISTS observaciones (
+                id SERIAL PRIMARY KEY,
+                rut TEXT NOT NULL,
+                tipo TEXT NOT NULL,
+                texto TEXT NOT NULL,
+                docente TEXT NOT NULL,
+                fecha TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS justificaciones (
+                id SERIAL PRIMARY KEY,
+                rut TEXT NOT NULL,
+                curso TEXT NOT NULL,
+                mensaje TEXT NOT NULL,
+                fecha TEXT NOT NULL,
+                leida INTEGER DEFAULT 0
+            )""",
+            "ALTER TABLE justificaciones ADD COLUMN IF NOT EXISTS leida INTEGER DEFAULT 0",
+            """CREATE TABLE IF NOT EXISTS anuncios (
+                id SERIAL PRIMARY KEY,
+                curso TEXT NOT NULL,
+                texto TEXT NOT NULL,
+                docente TEXT NOT NULL,
+                fecha TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS auditoria_logs (
+                id SERIAL PRIMARY KEY,
+                fecha TEXT NOT NULL,
+                usuario TEXT NOT NULL,
+                accion TEXT NOT NULL,
+                detalle TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS configuracion_calendario (
+                id INTEGER PRIMARY KEY,
+                mes_cierre INTEGER DEFAULT 12,
+                dia_cierre INTEGER DEFAULT 20,
+                ultimo_anio_promocion INTEGER DEFAULT 2025,
+                ultimo_anio_limpieza INTEGER DEFAULT 2026
+            )""",
+            """CREATE TABLE IF NOT EXISTS historial_anual (
+                id SERIAL PRIMARY KEY,
+                anio INTEGER NOT NULL,
+                rut TEXT NOT NULL,
+                nombre TEXT NOT NULL,
+                curso_anterior TEXT NOT NULL,
+                curso_nuevo TEXT NOT NULL,
+                promedio_final REAL,
+                estado TEXT NOT NULL
+            )"""
+        ]
+        for sql in sentencias:
+            cursor.execute(sql)
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+        # Poblar cursos iniciales si está vacío
+        cursor.execute("SELECT COUNT(*) AS total FROM cursos")
+        if cursor.fetchone()["total"] == 0:
+            for c_nom, c_ord in CURSOS_INICIALES:
+                cursor.execute("INSERT INTO cursos (nombre, orden) VALUES (%s, %s) ON CONFLICT DO NOTHING", (c_nom, c_ord))
 
+        # Poblar asignaturas iniciales si está vacío
+        cursor.execute("SELECT COUNT(*) AS total FROM asignaturas")
+        if cursor.fetchone()["total"] == 0:
+            for a_nom in ASIGNATURAS_INICIALES:
+                cursor.execute("INSERT INTO asignaturas (nombre, activa) VALUES (%s, 1) ON CONFLICT DO NOTHING", (a_nom,))
 
-@app.get("/")
-async def inicio():
-    return FileResponse("static/index.html")
+        # Crear perfil maestro oficial de la Directora: Paulina Toledo / escuela16
+        cursor.execute("SELECT id FROM docentes WHERE UPPER(nombre) = 'PAULINA TOLEDO'")
+        if not cursor.fetchone():
+            pwd_hash = pwd_context.hash("escuela16")
+            cursor.execute(
+                "INSERT INTO docentes (nombre, password_hash, cursos, rol, activo) VALUES (%s, %s, %s, 'maestro', 1)",
+                ("PAULINA TOLEDO", pwd_hash, "*")
+            )
+
+        anio_actual = ahora_chile().year
+        cursor.execute(
+            """
+            INSERT INTO configuracion_calendario (id, mes_cierre, dia_cierre, ultimo_anio_promocion, ultimo_anio_limpieza)
+            VALUES (1, 12, 20, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (anio_actual - 1, anio_actual)
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print("Advertencia init_db:", e)
+    finally:
+        cursor.close()
+        conn.close()
+    verificar_automatizacion_calendario()
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+
+# --- MODELOS PYDANTIC ---
+class LoginRequest(BaseModel):
+    rol: str
+    identificador: str
+    password: Optional[str] = None
+
+class CursoCreate(BaseModel):
+    nombre: str
+    orden: int = 10
+
+class AsignaturaCreate(BaseModel):
+    nombre: str
+
+class AlumnoCreate(BaseModel):
+    rut: str
+    nombre: str
+    curso: str
+
+class AlumnoUpdate(BaseModel):
+    nombre: str
+    curso: str
+
+class AlumnoBulkItem(BaseModel):
+    rut: str
+    nombre: str
+    curso: str
+
+class AlumnoBulkImport(BaseModel):
+    alumnos: List[AlumnoBulkItem]
+
+class ReasignarMasivo(BaseModel):
+    ruts: List[str]
+    nuevo_curso: str
+
+class DocenteCreate(BaseModel):
+    nombre: str
+    password: str
+    cursos: str
+    rol: Optional[str] = "docente"
+
+class DocenteUpdate(BaseModel):
+    nombre: str
+    cursos: str
+    password: Optional[str] = None
+    rol: Optional[str] = "docente"
+    activo: Optional[int] = 1
+
+class NotaCreate(BaseModel):
+    rut: str
+    asignatura: str
+    nota: float
+    semestre: int
+    docente: str
+
+class AsistenciaItem(BaseModel):
+    rut: str
+    estado: str # P, A, T, J
+
+class AsistenciaBatch(BaseModel):
+    curso: str
+    fecha: str
+    docente: str
+    registros: List[AsistenciaItem]
+
+class ObservacionCreate(BaseModel):
+    rut: str
+    tipo: str
+    texto: str
+    docente: str
+
+class JustificacionCreate(BaseModel):
+    rut: str
+    curso: str
+    mensaje: str
+
+class AnuncioCreate(BaseModel):
+    curso: str # o "TODOS"
+    texto: str
+    docente: str
+
+class CalendarioConfigUpdate(BaseModel):
+    mes_cierre: int
+    dia_cierre: int
+
+# --- ENDPOINTS GENERALES ---
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok", "version": "8.0", "hora_chile": ahora_chile().strftime("%Y-%m-%d %H:%M:%S")}
+
+@app.get("/api/catalogos")
+def obtener_catalogos():
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT id, nombre, orden FROM cursos ORDER BY orden ASC, id ASC")
+        cursos = [dict(r) for r in cursor.fetchall()]
+        cursor.execute("SELECT id, nombre, activa FROM asignaturas WHERE activa = 1 ORDER BY id ASC")
+        asignaturas = [dict(r) for r in cursor.fetchall()]
+        return {"cursos": cursos, "asignaturas": asignaturas}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/api/login")
+def login(data: LoginRequest):
+    verificar_automatizacion_calendario()
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        if data.rol in ["docente", "maestro"]:
+            nombre_norm = data.identificador.strip().upper()
+            cursor.execute("SELECT * FROM docentes WHERE UPPER(nombre) = %s AND activo = 1", (nombre_norm,))
+            docente = cursor.fetchone()
+            if not docente or not data.password or not pwd_context.verify(data.password, docente["password_hash"]):
+                raise HTTPException(status_code=401, detail="Nombre o contraseña incorrectos")
+
+            rol_asignado = docente.get("rol") or "docente"
+            if docente["cursos"].strip() == "*" or rol_asignado == "maestro":
+                cursor.execute("SELECT nombre FROM cursos ORDER BY orden ASC, id ASC")
+                cursos_lista = [r["nombre"] for r in cursor.fetchall()]
+            else:
+                cursos_lista = [c.strip() for c in docente["cursos"].split(",") if c.strip()]
+
+            token = crear_token_usuario(docente["nombre"], rol_asignado, cursos_lista)
+            registrar_log(cursor, docente["nombre"], "LOGIN", f"Inicio de sesión ({rol_asignado})")
+            conn.commit()
+            return {
+                "rol": rol_asignado,
+                "nombre": docente["nombre"],
+                "cursos": cursos_lista,
+                "token": token
+            }
+
+        elif data.rol == "estudiante":
+            rut_limpio = normalizar_rut(data.identificador)
+            cursor.execute("SELECT * FROM alumnos WHERE UPPER(REPLACE(rut, '.', '')) = %s AND activo = 1", (rut_limpio,))
+            alumno = cursor.fetchone()
+            if not alumno:
+                raise HTTPException(status_code=404, detail="Estudiante no encontrado o inactivo")
+            return {
+                "rol": "estudiante",
+                "rut": alumno["rut"],
+                "nombre": alumno["nombre"],
+                "curso": alumno["curso"]
+            }
+
+        raise HTTPException(status_code=400, detail="Rol no válido")
+    finally:
+        cursor.close()
+        conn.close()
+
+# --- APIS MAESTRO (DIRECCIÓN) ---
+@app.get("/api/maestro/resumen")
+def resumen_maestro(user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT * FROM alumnos ORDER BY curso, nombre")
+        alumnos = [dict(r) for r in cursor.fetchall()]
+        cursor.execute("SELECT * FROM notas")
+        notas = [dict(r) for r in cursor.fetchall()]
+        cursor.execute("SELECT * FROM observaciones")
+        observaciones = [dict(r) for r in cursor.fetchall()]
+        cursor.execute("SELECT * FROM asistencia")
+        asistencias = [dict(r) for r in cursor.fetchall()]
+        cursor.execute("SELECT id, nombre, cursos, rol, activo FROM docentes ORDER BY rol DESC, nombre ASC")
+        docentes = [dict(r) for r in cursor.fetchall()]
+        cursor.execute("SELECT id, nombre, orden FROM cursos ORDER BY orden ASC, id ASC")
+        cursos = [dict(r) for r in cursor.fetchall()]
+        cursor.execute("SELECT id, nombre, activa FROM asignaturas ORDER BY id ASC")
+        asignaturas = [dict(r) for r in cursor.fetchall()]
+        cursor.execute("SELECT * FROM auditoria_logs ORDER BY id DESC LIMIT 80")
+        logs = [dict(r) for r in cursor.fetchall()]
+        cursor.execute("SELECT * FROM justificaciones ORDER BY leida ASC, fecha DESC")
+        justificaciones = [dict(r) for r in cursor.fetchall()]
+
+        return {
+            "alumnos": alumnos,
+            "notas": notas,
+            "observaciones": observaciones,
+            "asistencias": asistencias,
+            "docentes": docentes,
+            "cursos": cursos,
+            "asignaturas": asignaturas,
+            "logs": logs,
+            "justificaciones": justificaciones,
+            "fecha_chile": ahora_chile().strftime("%Y-%m-%d")
+        }
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/api/maestro/cursos")
+def crear_curso_maestro(datos: CursoCreate, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    nombre = datos.nombre.strip()
+    if not nombre:
+        raise HTTPException(status_code=400, detail="Nombre de curso requerido")
+    try:
+        cursor.execute("INSERT INTO cursos (nombre, orden) VALUES (%s, %s)", (nombre, datos.orden))
+        registrar_log(cursor, user["nombre"], "CREAR_CURSO", f"Creó curso: {nombre}")
+        conn.commit()
+        return {"mensaje": "Curso creado"}
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail="Ese curso ya existe")
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.delete("/api/maestro/cursos/{curso_id}")
+def eliminar_curso_maestro(curso_id: int, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT nombre FROM cursos WHERE id = %s", (curso_id,))
+        c = cursor.fetchone()
+        if not c:
+            raise HTTPException(status_code=404, detail="Curso no encontrado")
+        cursor.execute("SELECT COUNT(*) AS total FROM alumnos WHERE curso = %s AND activo = 1", (c["nombre"],))
+        if cursor.fetchone()["total"] > 0:
+            raise HTTPException(status_code=400, detail="No puedes eliminar un curso que tiene alumnos activos. Trasládalos primero.")
+        cursor.execute("DELETE FROM cursos WHERE id = %s", (curso_id,))
+        registrar_log(cursor, user["nombre"], "ELIMINAR_CURSO", f"Eliminó curso: {c['nombre']}")
+        conn.commit()
+        return {"mensaje": "Curso eliminado"}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/api/maestro/asignaturas")
+def crear_asignatura_maestro(datos: AsignaturaCreate, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    nombre = datos.nombre.strip()
+    if not nombre:
+        raise HTTPException(status_code=400, detail="Nombre requerido")
+    try:
+        cursor.execute("INSERT INTO asignaturas (nombre, activa) VALUES (%s, 1) ON CONFLICT (nombre) DO UPDATE SET activa = 1", (nombre,))
+        registrar_log(cursor, user["nombre"], "CREAR_ASIGNATURA", f"Activó/creó asignatura: {nombre}")
+        conn.commit()
+        return {"mensaje": "Asignatura guardada"}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.delete("/api/maestro/asignaturas/{asig_id}")
+def eliminar_asignatura_maestro(asig_id: int, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM asignaturas WHERE id = %s", (asig_id,))
+        registrar_log(cursor, user["nombre"], "ELIMINAR_ASIGNATURA", f"Eliminó asignatura ID {asig_id}")
+        conn.commit()
+        return {"mensaje": "Asignatura eliminada"}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/api/maestro/docentes")
+def crear_docente_maestro(datos: DocenteCreate, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        pwd_hash = pwd_context.hash(datos.password)
+        nombre_norm = datos.nombre.strip().upper()
+        rol_val = datos.rol if datos.rol in ["docente", "maestro"] else "docente"
+        cursos_val = "*" if rol_val == "maestro" else datos.cursos.strip()
+        cursor.execute(
+            "INSERT INTO docentes (nombre, password_hash, cursos, rol, activo) VALUES (%s, %s, %s, %s, 1)",
+            (nombre_norm, pwd_hash, cursos_val, rol_val)
+        )
+        registrar_log(cursor, user["nombre"], "CREAR_DOCENTE", f"Creó usuario {nombre_norm} ({rol_val})")
+        conn.commit()
+        return {"mensaje": "Perfil creado correctamente"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=f"Error al crear usuario (posible nombre duplicado): {str(e)}")
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.put("/api/maestro/docentes/{docente_id}")
+def actualizar_docente_maestro(docente_id: int, datos: DocenteUpdate, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        nombre_norm = datos.nombre.strip().upper()
+        rol_val = datos.rol if datos.rol in ["docente", "maestro"] else "docente"
+        cursos_val = "*" if rol_val == "maestro" else datos.cursos.strip()
+        if datos.password:
+            pwd_hash = pwd_context.hash(datos.password)
+            cursor.execute(
+                "UPDATE docentes SET nombre = %s, password_hash = %s, cursos = %s, rol = %s, activo = %s WHERE id = %s",
+                (nombre_norm, pwd_hash, cursos_val, rol_val, datos.activo if datos.activo is not None else 1, docente_id)
+            )
+        else:
+            cursor.execute(
+                "UPDATE docentes SET nombre = %s, cursos = %s, rol = %s, activo = %s WHERE id = %s",
+                (nombre_norm, cursos_val, rol_val, datos.activo if datos.activo is not None else 1, docente_id)
+            )
+        registrar_log(cursor, user["nombre"], "EDITAR_DOCENTE", f"Editó usuario ID {docente_id} ({nombre_norm})")
+        conn.commit()
+        return {"mensaje": "Perfil actualizado correctamente"}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.delete("/api/maestro/docentes/{docente_id}")
+def eliminar_docente_maestro(docente_id: int, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT nombre FROM docentes WHERE id = %s", (docente_id,))
+        doc = cursor.fetchone()
+        if doc and doc["nombre"].upper() == user["nombre"].upper():
+            raise HTTPException(status_code=400, detail="No puedes eliminar tu propia cuenta activa")
+        cursor.execute("DELETE FROM docentes WHERE id = %s", (docente_id,))
+        registrar_log(cursor, user["nombre"], "ELIMINAR_DOCENTE", f"Eliminó docente {doc['nombre'] if doc else docente_id}")
+        conn.commit()
+        return {"mensaje": "Usuario eliminado"}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/api/maestro/alumnos/importar")
+def importar_alumnos_masivo(datos: AlumnoBulkImport, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    creados = 0
+    errores = []
+    try:
+        for item in datos.alumnos:
+            rut_norm = normalizar_rut(item.rut)
+            if not validar_rut_modulo11(rut_norm):
+                errores.append(f"{item.rut}: RUT inválido")
+                continue
+            cursor.execute(
+                """
+                INSERT INTO alumnos (rut, nombre, curso, activo)
+                VALUES (%s, %s, %s, 1)
+                ON CONFLICT (rut) DO UPDATE SET nombre = EXCLUDED.nombre, curso = EXCLUDED.curso, activo = 1
+                """,
+                (rut_norm, item.nombre.strip().upper(), item.curso.strip())
+            )
+            creados += 1
+        registrar_log(cursor, user["nombre"], "IMPORTACION_MASIVA", f"Importó/actualizó {creados} alumnos vía CSV.")
+        conn.commit()
+        return {"creados": creados, "errores": errores}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/api/maestro/alumnos/reasignar")
+def reasignar_alumnos_curso(datos: ReasignarMasivo, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        ruts_norm = [normalizar_rut(r) for r in datos.ruts]
+        cursor.execute("UPDATE alumnos SET curso = %s WHERE rut = ANY(%s)", (datos.nuevo_curso.strip(), ruts_norm))
+        registrar_log(cursor, user["nombre"], "TRASLADO_CURSO", f"Trasladó {len(ruts_norm)} alumnos a {datos.nuevo_curso}")
+        conn.commit()
+        return {"mensaje": f"{len(ruts_norm)} alumnos trasladados a {datos.nuevo_curso}"}
+    finally:
+        cursor.close()
+        conn.close()
+
+# --- APIS ASISTENCIA ---
+@app.get("/api/asistencia")
+def obtener_asistencia(curso: str, fecha: str, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT * FROM asistencia WHERE curso = %s AND fecha = %s", (curso, fecha))
+        return [dict(r) for r in cursor.fetchall()]
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/api/asistencia")
+def guardar_asistencia(datos: AsistenciaBatch, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        for reg in datos.registros:
+            rut_norm = normalizar_rut(reg.rut)
+            cursor.execute(
+                """
+                INSERT INTO asistencia (rut, curso, fecha, estado, docente)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (rut, fecha) DO UPDATE SET estado = EXCLUDED.estado, docente = EXCLUDED.docente, curso = EXCLUDED.curso
+                """,
+                (rut_norm, datos.curso, datos.fecha, reg.estado, datos.docente)
+            )
+        registrar_log(cursor, datos.docente, "ASISTENCIA", f"Pasó asistencia {datos.curso} ({datos.fecha})")
+        conn.commit()
+        return {"mensaje": "Asistencia guardada"}
+    finally:
+        cursor.close()
+        conn.close()
+
+# --- APIS COMPARTIDAS (DOCENTE Y MAESTRO) ---
+@app.get("/api/calendario")
+def obtener_calendario(user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    verificar_automatizacion_calendario()
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT * FROM configuracion_calendario WHERE id = 1")
+        cfg = dict(cursor.fetchone())
+        cursor.execute("SELECT * FROM historial_anual ORDER BY anio DESC, curso_anterior, nombre LIMIT 200")
+        historial = [dict(r) for r in cursor.fetchall()]
+        return {"config": cfg, "fecha_servidor": ahora_chile().strftime("%Y-%m-%d %H:%M"), "historial": historial}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.put("/api/calendario")
+def actualizar_calendario(datos: CalendarioConfigUpdate, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE configuracion_calendario SET mes_cierre = %s, dia_cierre = %s WHERE id = 1", (datos.mes_cierre, datos.dia_cierre))
+        registrar_log(cursor, user["nombre"], "CONFIG_CALENDARIO", f"Cierre escolar fijado: {datos.dia_cierre}/{datos.mes_cierre}")
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+    verificar_automatizacion_calendario()
+    return {"mensaje": "Calendario actualizado"}
+
+@app.post("/api/calendario/simular-cierre")
+def forzar_promocion_ahora(user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        anio = ahora_chile().year
+        ejecutar_promocion_anual(cursor, anio, user["nombre"])
+        conn.commit()
+        return {"mensaje": f"Promoción anual {anio} ejecutada correctamente."}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.get("/api/docente/panel")
+def panel_docente(cursos: str, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    verificar_automatizacion_calendario()
+    lista_cursos = [c.strip() for c in cursos.split(",") if c.strip()]
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        if "*" in lista_cursos or user.get("rol") == "maestro":
+            cursor.execute("SELECT * FROM alumnos ORDER BY curso, nombre")
+            alumnos = [dict(r) for r in cursor.fetchall()]
+            cursor.execute("SELECT * FROM notas")
+            notas = [dict(r) for r in cursor.fetchall()]
+            cursor.execute("SELECT * FROM asistencia")
+            asistencias = [dict(r) for r in cursor.fetchall()]
+            cursor.execute("SELECT * FROM justificaciones ORDER BY leida ASC, fecha DESC")
+            justificaciones = [dict(r) for r in cursor.fetchall()]
+        else:
+            cursor.execute("SELECT * FROM alumnos WHERE curso = ANY(%s) ORDER BY curso, nombre", (lista_cursos,))
+            alumnos = [dict(r) for r in cursor.fetchall()]
+            ruts = [a["rut"] for a in alumnos]
+            notas = []
+            asistencias = []
+            if ruts:
+                cursor.execute("SELECT * FROM notas WHERE rut = ANY(%s)", (ruts,))
+                notas = [dict(r) for r in cursor.fetchall()]
+                cursor.execute("SELECT * FROM asistencia WHERE rut = ANY(%s)", (ruts,))
+                asistencias = [dict(r) for r in cursor.fetchall()]
+            cursor.execute("SELECT * FROM justificaciones WHERE curso = ANY(%s) ORDER BY leida ASC, fecha DESC", (lista_cursos,))
+            justificaciones = [dict(r) for r in cursor.fetchall()]
+
+        cursor.execute("SELECT id, nombre FROM asignaturas WHERE activa = 1 ORDER BY id ASC")
+        asignaturas = [dict(r) for r in cursor.fetchall()]
+        return {
+            "alumnos": alumnos,
+            "notas": notas,
+            "asistencias": asistencias,
+            "justificaciones": justificaciones,
+            "asignaturas": asignaturas,
+            "hoy_chile": ahora_chile().strftime("%Y-%m-%d")
+        }
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.get("/api/alumnos")
+def listar_alumnos(incluir_inactivos: bool = False):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        if incluir_inactivos:
+            cursor.execute("SELECT * FROM alumnos ORDER BY curso, nombre")
+        else:
+            cursor.execute("SELECT * FROM alumnos WHERE activo = 1 ORDER BY curso, nombre")
+        return [dict(row) for row in cursor.fetchall()]
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/api/alumnos")
+def crear_alumno(alumno: AlumnoCreate, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    rut_norm = normalizar_rut(alumno.rut)
+    if not validar_rut_modulo11(rut_norm):
+        raise HTTPException(status_code=400, detail="RUT inválido (dígito verificador no corresponde)")
+
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT activo FROM alumnos WHERE UPPER(REPLACE(rut, '.', '')) = %s", (rut_norm,))
+        existente = cursor.fetchone()
+        if existente:
+            if existente["activo"] == 0:
+                cursor.execute("UPDATE alumnos SET nombre = %s, curso = %s, activo = 1 WHERE UPPER(REPLACE(rut, '.', '')) = %s", (alumno.nombre.strip().upper(), alumno.curso.strip(), rut_norm))
+                registrar_log(cursor, user["nombre"], "REACTIVAR_ALUMNO", f"Reactivó alumno {rut_norm}")
+                conn.commit()
+                return {"mensaje": "Alumno reactivado", "rut": rut_norm}
+            else:
+                raise HTTPException(status_code=400, detail="Ese RUT ya está registrado y activo")
+
+        cursor.execute("INSERT INTO alumnos (rut, nombre, curso, activo) VALUES (%s, %s, %s, 1)", (rut_norm, alumno.nombre.strip().upper(), alumno.curso.strip()))
+        registrar_log(cursor, user["nombre"], "CREAR_ALUMNO", f"Matriculó a {alumno.nombre.strip().upper()} ({rut_norm}) en {alumno.curso}")
+        conn.commit()
+        return {"mensaje": "Alumno creado correctamente", "rut": rut_norm}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.put("/api/alumnos/{rut}")
+def editar_alumno(rut: str, datos: AlumnoUpdate, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    rut_norm = normalizar_rut(rut)
+    try:
+        cursor.execute("UPDATE alumnos SET nombre = %s, curso = %s WHERE UPPER(REPLACE(rut, '.', '')) = %s", (datos.nombre.strip().upper(), datos.curso.strip(), rut_norm))
+        registrar_log(cursor, user["nombre"], "EDITAR_ALUMNO", f"Editó alumno {rut_norm} -> {datos.nombre.strip().upper()} ({datos.curso})")
+        conn.commit()
+        return {"mensaje": "Datos actualizados"}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.patch("/api/alumnos/{rut}/estado")
+def cambiar_estado_alumno(rut: str, activo: int, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    rut_norm = normalizar_rut(rut)
+    try:
+        cursor.execute("UPDATE alumnos SET activo = %s WHERE UPPER(REPLACE(rut, '.', '')) = %s", (activo, rut_norm))
+        registrar_log(cursor, user["nombre"], "ESTADO_ALUMNO", f"Cambió activo={activo} para {rut_norm}")
+        conn.commit()
+        return {"mensaje": "Estado actualizado"}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.delete("/api/alumnos/{rut}")
+def eliminar_alumno_definitivo(rut: str, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    rut_norm = normalizar_rut(rut)
+    try:
+        cursor.execute("DELETE FROM notas WHERE UPPER(REPLACE(rut, '.', '')) = %s", (rut_norm,))
+        cursor.execute("DELETE FROM observaciones WHERE UPPER(REPLACE(rut, '.', '')) = %s", (rut_norm,))
+        cursor.execute("DELETE FROM justificaciones WHERE UPPER(REPLACE(rut, '.', '')) = %s", (rut_norm,))
+        cursor.execute("DELETE FROM asistencia WHERE UPPER(REPLACE(rut, '.', '')) = %s", (rut_norm,))
+        cursor.execute("DELETE FROM alumnos WHERE UPPER(REPLACE(rut, '.', '')) = %s", (rut_norm,))
+        registrar_log(cursor, user["nombre"], "ELIMINAR_ALUMNO", f"Eliminó definitivamente alumno {rut_norm}")
+        conn.commit()
+        return {"mensaje": "Eliminado definitivamente"}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/api/notas")
+def agregar_nota(nota: NotaCreate, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    if not (1.0 <= nota.nota <= 7.0):
+        raise HTTPException(status_code=400, detail="Nota debe estar entre 1.0 y 7.0")
+    conn = DBConnection()
+    cursor = conn.cursor()
+    rut_norm = normalizar_rut(nota.rut)
+    try:
+        fecha = ahora_chile().strftime("%Y-%m-%d %H:%M")
+        cursor.execute("INSERT INTO notas (rut, asignatura, nota, semestre, fecha, docente) VALUES (%s, %s, %s, %s, %s, %s)", (rut_norm, nota.asignatura, round(nota.nota, 1), nota.semestre, fecha, nota.docente))
+        registrar_log(cursor, nota.docente, "NUEVA_NOTA", f"Nota {round(nota.nota, 1)} en {nota.asignatura} para {rut_norm}")
+        conn.commit()
+        return {"mensaje": "Nota registrada"}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.delete("/api/notas/{nota_id}")
+def eliminar_nota(nota_id: int, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT * FROM notas WHERE id = %s", (nota_id,))
+        n = cursor.fetchone()
+        cursor.execute("DELETE FROM notas WHERE id = %s", (nota_id,))
+        if n:
+            registrar_log(cursor, user["nombre"], "ELIMINAR_NOTA", f"Borró nota {n['nota']} ({n['asignatura']}) de {n['rut']}")
+        conn.commit()
+        return {"mensaje": "Nota eliminada"}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.get("/api/portal/{rut}")
+def datos_estudiante(rut: str):
+    verificar_automatizacion_calendario()
+    conn = DBConnection()
+    cursor = conn.cursor()
+    rut_norm = normalizar_rut(rut)
+    try:
+        cursor.execute("SELECT * FROM alumnos WHERE UPPER(REPLACE(rut, '.', '')) = %s", (rut_norm,))
+        alumno = cursor.fetchone()
+        if not alumno:
+            raise HTTPException(status_code=404, detail="Alumno no encontrado")
+        curso = alumno["curso"]
+        rut_real = alumno["rut"]
+        cursor.execute("SELECT * FROM notas WHERE rut = %s", (rut_real,))
+        notas = [dict(r) for r in cursor.fetchall()]
+        cursor.execute("SELECT * FROM observaciones WHERE rut = %s ORDER BY fecha DESC", (rut_real,))
+        observaciones = [dict(r) for r in cursor.fetchall()]
+        cursor.execute("SELECT * FROM justificaciones WHERE rut = %s ORDER BY fecha DESC", (rut_real,))
+        justificaciones = [dict(r) for r in cursor.fetchall()]
+        cursor.execute("SELECT * FROM anuncios WHERE curso = %s OR curso = 'TODOS' ORDER BY fecha DESC", (curso,))
+        anuncios = [dict(r) for r in cursor.fetchall()]
+        cursor.execute("SELECT * FROM asistencia WHERE rut = %s ORDER BY fecha DESC", (rut_real,))
+        asistencia = [dict(r) for r in cursor.fetchall()]
+        return {
+            "alumno": dict(alumno),
+            "notas": notas,
+            "observaciones": observaciones,
+            "justificaciones": justificaciones,
+            "anuncios": anuncios,
+            "asistencia": asistencia,
+            "fecha_emision": ahora_chile().strftime("%d/%m/%Y")
+        }
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/api/observaciones")
+def crear_observacion(obs: ObservacionCreate, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    rut_norm = normalizar_rut(obs.rut)
+    try:
+        fecha = ahora_chile().strftime("%Y-%m-%d %H:%M")
+        cursor.execute("INSERT INTO observaciones (rut, tipo, texto, docente, fecha) VALUES (%s, %s, %s, %s, %s)", (rut_norm, obs.tipo, obs.texto, obs.docente, fecha))
+        registrar_log(cursor, obs.docente, "OBSERVACION", f"Observación ({obs.tipo}) para {rut_norm}")
+        conn.commit()
+        return {"mensaje": "Observación guardada"}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/api/justificaciones")
+def crear_justificacion(just: JustificacionCreate):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        fecha = ahora_chile().strftime("%Y-%m-%d %H:%M")
+        cursor.execute("INSERT INTO justificaciones (rut, curso, mensaje, fecha, leida) VALUES (%s, %s, %s, %s, 0)", (normalizar_rut(just.rut), just.curso, just.mensaje, fecha))
+        conn.commit()
+        return {"mensaje": "Justificación enviada"}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.patch("/api/justificaciones/{just_id}/leer")
+def marcar_justificacion_leida(just_id: int, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE justificaciones SET leida = 1 WHERE id = %s", (just_id,))
+        conn.commit()
+        return {"mensaje": "Archivada"}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/api/anuncios")
+def crear_anuncio(anuncio: AnuncioCreate, user: dict = Depends(lambda h=Header(None): verificar_auth(h, ["docente", "maestro"]))):
+    conn = DBConnection()
+    cursor = conn.cursor()
+    try:
+        fecha = ahora_chile().strftime("%Y-%m-%d %H:%M")
+        cursor.execute("INSERT INTO anuncios (curso, texto, docente, fecha) VALUES (%s, %s, %s, %s)", (anuncio.curso, anuncio.texto, anuncio.docente, fecha))
+        registrar_log(cursor, anuncio.docente, "ANUNCIO", f"Publicó anuncio para {anuncio.curso}")
+        conn.commit()
+        return {"mensaje": "Anuncio publicado"}
+    finally:
+        cursor.close()
+        conn.close()
+
+app.mount("/", StaticFiles(directory=".", html=True), name="static")
